@@ -147,7 +147,7 @@ default:
       # Clone and fetch from develop branch
       git clone --no-checkout "$HIVE_URL" hive
       cd hive
-      git fetch origin develop
+      git fetch origin develop master || git fetch origin "$HIVE_COMMIT"
       git checkout $HIVE_COMMIT
       # Initialize only test-related submodules inside hive (skip rocksdb, zstd, fc, appbase, compression_dictionaries)
       git submodule update --init tests/python/hive-local-tools/tests_api
@@ -172,7 +172,7 @@ default:
       # Clone and fetch from develop branch
       git clone --no-checkout "$HIVE_URL" hive
       cd hive
-      git fetch origin develop
+      git fetch origin develop master || git fetch origin "$HIVE_COMMIT"
       git checkout $HIVE_COMMIT
       # Initialize ALL submodules recursively (needed for rebuilding HAF)
       git submodule update --init --recursive
