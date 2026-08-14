@@ -140,7 +140,7 @@ RUN ./scripts/setup_ubuntu.sh --dev --hived-account="hived" \
 # Install user packages (faketime, websocat, poetry) as hived
 # Run as root to avoid sudo issues, then switch to hived for the build stage
 WORKDIR /home/hived
-RUN HOME=/home/hived /usr/local/src/scripts/setup_ubuntu.sh --user && \
+RUN SKIP_FAKETIME=1 HOME=/home/hived /usr/local/src/scripts/setup_ubuntu.sh --user && \
     chown -R hived:users /home/hived
 
 USER hived
@@ -166,6 +166,13 @@ ARG SCCACHE_REDIS=""
 ENV SCCACHE_REDIS=${SCCACHE_REDIS}
 
 ENV HAF_SOURCE_DIR="/home/hived/source/${HIVE_SUBDIR}"
+
+# Ensure faketime paths exist even when SKIP_FAKETIME=1, so the COPYs in the
+# instance stage don't fail on a missing source directory. Done as root because
+# the hived user has no passwordless sudo in the ci-base-image build stage.
+USER root
+RUN mkdir -p /home/hived/hive_base_config/faketime/src /usr/local/lib/faketime && \
+    chown -R hived:users /home/hived/hive_base_config
 
 USER hived
 WORKDIR /home/hived
@@ -271,9 +278,9 @@ COPY --from=build --chown=hived:users \
   /home/hived/bin/op_body_filter \
   /home/hived/bin/
 
-COPY --from=build --chown=hived:users /home/hived/hive_base_config/faketime/src/libfaketime*.so.1 \
-  /home/hived/hive_base_config/faketime/src/
-COPY --from=build --chown=root:root /usr/local/lib/faketime/* /usr/local/lib/faketime/
+COPY --from=build --chown=hived:users /home/hived/hive_base_config/faketime/ \
+  /home/hived/hive_base_config/faketime/
+COPY --from=build --chown=root:root /usr/local/lib/faketime/ /usr/local/lib/faketime/
 
 COPY --from=build \
   /usr/share/postgresql/${POSTGRES_VERSION}/extension/* \
