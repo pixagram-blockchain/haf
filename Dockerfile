@@ -140,6 +140,15 @@ COPY ./hive/scripts/openssl.conf /usr/local/src/hive/scripts/openssl.conf
 COPY ./hive/scripts/setup_ubuntu.sh /usr/local/src/hive/scripts/
 COPY ./scripts/setup_ubuntu.sh /usr/local/src/scripts/
 
+# Force git onto HTTP/1.1 for every clone made in this stage (and in the build
+# stage, which inherits this layer). git 2.43 on Ubuntu 24.04 speaking HTTP/2 to
+# github.com gets a bare "HTTP/2 401" on public repos and reports it as
+# "could not read Username for 'https://github.com'". setup_ubuntu.sh clones
+# citusdata/pg_cron, so without this the --dev step below dies with exit 128.
+# Set at the system level rather than per-command because the clones live inside
+# the scripts, not in this Dockerfile.
+RUN git config --system http.version HTTP/1.1
+
 # Install development packages (haf_admin already exists in ci-base-image)
 RUN ./scripts/setup_ubuntu.sh --dev --hived-account="hived" \
   && rm -rf /var/lib/apt/lists/*
