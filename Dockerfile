@@ -76,7 +76,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # upstream added an unconditional -lintl (for mingw64) to SHLIB_LINK, which doesn't exist as a
 # standalone library on glibc systems.
 WORKDIR /tmp
-RUN git clone --depth 1 --branch v1.6.7 https://github.com/citusdata/pg_cron.git
+# http.version=HTTP/1.1 is required, not cosmetic. git 2.43 (Ubuntu 24.04) talking
+# HTTP/2 to github.com gets back a bare "HTTP/2 401" for this public repo, which git
+# reports as:
+#     fatal: could not read Username for 'https://github.com'
+# Same command over HTTP/1.1 (or with protocol.version=0) succeeds from the identical
+# container, so it is the HTTP/2 path that breaks, not credentials, DNS, a proxy or
+# rate limiting. Alpine's git is unaffected, which is why this only bites here.
+RUN git -c http.version=HTTP/1.1 clone --depth 1 --branch v1.6.7 https://github.com/citusdata/pg_cron.git
 
 # Build and "install" pg_cron to a temporary location (using DESTDIR).
 WORKDIR /tmp/pg_cron
