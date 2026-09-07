@@ -76,7 +76,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # upstream added an unconditional -lintl (for mingw64) to SHLIB_LINK, which doesn't exist as a
 # standalone library on glibc systems.
 WORKDIR /tmp
-RUN git clone --depth 1 --branch v1.6.7 https://github.com/citusdata/pg_cron.git
+# http.version=HTTP/1.1 is required, not cosmetic. git 2.43 (Ubuntu 24.04) talking
+# HTTP/2 to github.com gets back a bare "HTTP/2 401" for this public repo, which git
+# reports as:
+#     fatal: could not read Username for 'https://github.com'
+# Same command over HTTP/1.1 (or with protocol.version=0) succeeds from the identical
+# container, so it is the HTTP/2 path that breaks, not credentials, DNS, a proxy or
+# rate limiting. Alpine's git is unaffected, which is why this only bites here.
+RUN git -c http.version=HTTP/1.1 clone --depth 1 --branch v1.6.7 https://github.com/citusdata/pg_cron.git
 
 # Build and "install" pg_cron to a temporary location (using DESTDIR).
 WORKDIR /tmp/pg_cron
@@ -132,6 +139,15 @@ WORKDIR /usr/local/src
 COPY ./hive/scripts/openssl.conf /usr/local/src/hive/scripts/openssl.conf
 COPY ./hive/scripts/setup_ubuntu.sh /usr/local/src/hive/scripts/
 COPY ./scripts/setup_ubuntu.sh /usr/local/src/scripts/
+
+# Force git onto HTTP/1.1 for every clone made in this stage (and in the build
+# stage, which inherits this layer). git 2.43 on Ubuntu 24.04 speaking HTTP/2 to
+# github.com gets a bare "HTTP/2 401" on public repos and reports it as
+# "could not read Username for 'https://github.com'". setup_ubuntu.sh clones
+# citusdata/pg_cron, so without this the --dev step below dies with exit 128.
+# Set at the system level rather than per-command because the clones live inside
+# the scripts, not in this Dockerfile.
+RUN git config --system http.version HTTP/1.1
 
 # Install development packages (haf_admin already exists in ci-base-image)
 RUN ./scripts/setup_ubuntu.sh --dev --hived-account="hived" \
