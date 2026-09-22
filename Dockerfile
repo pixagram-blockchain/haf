@@ -178,6 +178,10 @@ ENV HIVE_LINT=${HIVE_LINT}
 ARG HIVE_SUBDIR=.
 ENV HIVE_SUBDIR=${HIVE_SUBDIR}
 
+# Parallel compile jobs; hive's build.sh honours it and otherwise sizes by RAM (~6 GB per job)
+ARG HIVE_BUILD_JOBS
+ENV HIVE_BUILD_JOBS=${HIVE_BUILD_JOBS}
+
 ARG SCCACHE_REDIS=""
 ENV SCCACHE_REDIS=${SCCACHE_REDIS}
 
