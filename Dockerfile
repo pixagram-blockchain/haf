@@ -3,7 +3,9 @@
 # docker buildx build --progress=plain --target=ci-base-image --tag registry.gitlab.syncad.com/hive/haf/ci-base-image$CI_IMAGE_TAG --file Dockerfile .
 # To be started from cloned haf source directory.
 ARG CI_REGISTRY_IMAGE=registry.gitlab.syncad.com/hive/haf/
-ARG POSTGRES_VERSION=18
+# Pixagram stays on PostgreSQL 17 (upstream's default is 18): the deployments' entrypoint
+# wrapper raises the open-file limit through /usr/lib/postgresql/17/bin/pg_ctl.
+ARG POSTGRES_VERSION=17
 ARG CI_IMAGE_TAG=ubuntu26.04-pg${POSTGRES_VERSION}-1
 
 ARG BUILD_IMAGE_TAG
