@@ -192,7 +192,58 @@ END;
 $body$;
 
 
-CREATE OR REPLACE PROCEDURE hive.app_next_iteration( _contexts hive.contexts_group, _blocks_range OUT hive.blocks_range, _override_max_batch INTEGER = NULL, _limit INTEGER = NULL )
+-- Periodic maintenance an application loop performs between transactions: VACUUM
+-- FULL of the shadow tables every 1200 blocks during live sync (the shadow tables
+-- see one row per changed row and are cleaned by hive.app_context_set_irreversible
+-- ... which leaves them bloated without this). Runs on its own connection, so it
+-- must be called outside the application's transaction: hive.app_next_iteration
+-- does this right after its COMMIT for the classic eternal CALL main() loops; a
+-- block-processing driver that owns the transaction (see Readme) calls it itself
+-- after committing an iteration. Returns TRUE when a vacuum was performed.
+CREATE OR REPLACE FUNCTION hive.app_perform_maintenance( _contexts hive.contexts_group )
+    RETURNS BOOLEAN
+    LANGUAGE plpgsql
+    VOLATILE
+AS
+$BODY$
+DECLARE
+    __lead_context_name hafd.context_name := _contexts[ 1 ];
+    __current_block_num INTEGER;
+    __last_shadow_vacuum_block INTEGER;
+BEGIN
+    SELECT current_block_num, (loop).last_shadow_vacuum_block
+    INTO __current_block_num, __last_shadow_vacuum_block
+    FROM hafd.contexts WHERE name = __lead_context_name;
+
+    IF hive.is_lite_schema() OR NOT hive.is_livesync( _contexts )
+       OR __current_block_num % 1200 != 0
+       OR ( __last_shadow_vacuum_block IS NOT NULL AND __current_block_num <= __last_shadow_vacuum_block )
+    THEN
+        RETURN FALSE;
+    END IF;
+
+    PERFORM hive.vacuum_shadow_table( rt.shadow_table_name )
+    FROM hafd.registered_tables AS rt
+    JOIN hafd.contexts AS c ON rt.context_id = c.id
+    WHERE c.name = __lead_context_name;
+
+    UPDATE hafd.contexts ctx
+    SET loop.last_shadow_vacuum_block = __current_block_num
+    WHERE ctx.name = ANY( _contexts );
+
+    RETURN TRUE;
+END;
+$BODY$
+;
+
+-- _wait: TRUE (default) waits inside the database for the next block when there
+--        is nothing to process, as the classic eternal CALL main() loops expect.
+--        FALSE returns NULL immediately; the caller then idles on its own
+--        connection until a NOTIFY on haf_new_block / haf_new_irreversible
+--        arrives (see Readme: block processing drivers).
+-- Applications registered with hive.app_register get NULL while paused, and are
+-- never given a block that one of their dependencies has not committed yet.
+CREATE OR REPLACE PROCEDURE hive.app_next_iteration( _contexts hive.contexts_group, _blocks_range OUT hive.blocks_range, _override_max_batch INTEGER = NULL, _limit INTEGER = NULL, _wait BOOLEAN = TRUE )
 LANGUAGE 'plpgsql'
 AS
 $body$
@@ -202,28 +253,33 @@ DECLARE
     __now TIMESTAMP := NOW();
     __previous_active_at_time TIMESTAMP;
     __hive_sync_state hafd.sync_state;
-    __current_block_num INTEGER;
-    __last_shadow_vacuum_block INTEGER;
-    __vacuum_performed BOOLEAN := FALSE;
+    __had_prior_xact BOOLEAN;
+    __block_limit INTEGER;
 BEGIN
-    -- here is the only place when main synchronization connection makes commit
-    -- 1. commit if there is a pending transaction
-    -- This should be the first line in the procedure.
-    IF pg_current_xact_id_if_assigned() IS NOT NULL THEN
+    -- Whether the caller invoked us with a transaction already carrying an
+    -- assigned XID. This is the same condition that has always gated the
+    -- COMMIT below; capture it up front because the heartbeat UPDATE later
+    -- in this procedure assigns an XID itself. When it is false the caller
+    -- is driving us inside an explicit transaction block (e.g. the example
+    -- apps), where issuing COMMIT is not allowed, so we skip both COMMITs.
+    __had_prior_xact := pg_current_xact_id_if_assigned() IS NOT NULL;
+
+    -- Subscribe to block-arrival notifications so hive.app_next_block can
+    -- wait on hive.wait_for_new_block instead of polling with pg_sleep
+    -- (issue #328). LISTEN is idempotent, so this is a no-op after the
+    -- first iteration in a session. The registration becomes effective at
+    -- the next COMMIT -- either the gated one below or, for callers that
+    -- drive their own transactions, their own COMMIT; until then the wait
+    -- falls back to its timeout.
+    LISTEN haf_new_block;
+    LISTEN haf_new_irreversible;
+
+    -- 1. commit if there is a pending transaction.
+    -- This should be the first statement in the procedure. (A second
+    -- COMMIT follows the heartbeat UPDATE below, see issue #328.)
+    IF __had_prior_xact THEN
         COMMIT;
-
-        SELECT current_block_num, (loop).last_shadow_vacuum_block
-        INTO __current_block_num, __last_shadow_vacuum_block
-        FROM hafd.contexts  WHERE name = __lead_context_name;
-
-        IF NOT hive.is_lite_schema() AND hive.is_livesync(_contexts) AND __current_block_num % 1200 = 0 AND (__last_shadow_vacuum_block IS NULL OR __current_block_num > __last_shadow_vacuum_block) THEN
-            PERFORM hive.vacuum_shadow_table(rt.shadow_table_name)
-            FROM hafd.registered_tables AS rt
-            JOIN hafd.contexts AS c ON rt.context_id = c.id
-            WHERE c.name = __lead_context_name;
-
-            __vacuum_performed := TRUE;
-        END IF;
+        PERFORM hive.app_perform_maintenance( _contexts );
     END IF;
 
     SELECT last_active_at INTO __previous_active_at_time
@@ -235,7 +291,15 @@ BEGIN
     UPDATE hafd.contexts ctx
     SET last_active_at = __now
     WHERE ctx.name = ANY(_contexts);
-
+    -- Commit the heartbeat immediately so this write transaction is not
+    -- held open across the wait inside hive.app_next_block during live
+    -- sync, which would pin the global snapshot horizon and throttle
+    -- HOT-prune / autovacuum (issue #328). Only when we are allowed to
+    -- COMMIT here (see __had_prior_xact); otherwise the heartbeat is
+    -- committed by the caller's own transaction control.
+    IF __had_prior_xact THEN
+        COMMIT;
+    END IF;
 
     IF _limit IS NOT NULL
     THEN
@@ -244,13 +308,25 @@ BEGIN
         END IF;
     END IF;
 
+    IF hive.app_is_paused( _contexts ) THEN
+        IF _wait THEN
+            PERFORM pg_sleep( 1 );
+        END IF;
+        RETURN;
+    END IF;
+
     IF NOT hive.is_instance_ready() THEN
         PERFORM hive.set_waiting_for_haf_stage( _contexts );
-        PERFORM pg_sleep( 0.5 );
+        IF _wait THEN
+            PERFORM pg_sleep( 0.5 );
+        END IF;
         RETURN;
     END IF;
 
     ASSERT _override_max_batch IS NULL OR _override_max_batch > 0, 'Custom size of  blocks range is less than 1';
+
+    -- dependency gating: never deliver a block a dependency has not committed
+    __block_limit := hive.app_dependencies_block_limit( _contexts );
 
     IF EXISTS( SELECT 1 FROM hafd.contexts hc WHERE hc.name = ANY(_contexts) AND hc.stages = NULL )
     THEN
@@ -260,7 +336,13 @@ BEGIN
     SELECT (hc.loop).* INTO __lead_context_state
     FROM hafd.contexts hc WHERE hc.name = __lead_context_name;
 
-    IF __lead_context_state IS NOT NULL
+    -- The alarm measures the time since the previous call, i.e. the previous
+    -- range's processing plus whatever the caller did in between. Loops that wait
+    -- for blocks inside the database (_wait) return here immediately, so that is
+    -- processing time; a driver that idles on its own connection between blocks
+    -- (_wait => FALSE) would trip it at every block interval, and measures the
+    -- processing time of each range itself instead.
+    IF _wait AND __lead_context_state IS NOT NULL
       AND ( __now - __previous_active_at_time ) >= (__lead_context_state).current_stage.processing_alarm_threshold
     THEN
         -- only lead context is reported
@@ -285,7 +367,7 @@ BEGIN
         -- app next block return range of irreversible blocks which are already synced
         -- but sync is in progress in sqlserializer and we may got millions of blocks
         -- here is no sense to switch the contexts
-        SELECT * FROM hive.app_next_block( _contexts ) INTO _blocks_range;
+        SELECT * FROM hive.app_next_block( _contexts, _wait, __block_limit ) INTO _blocks_range;
         IF _blocks_range IS NULL
         THEN
             RETURN;
@@ -304,6 +386,7 @@ BEGIN
               )
             , COALESCE( _limit, __lead_context_state.end_block_range)
             , __lead_context_state.end_block_range
+            , __block_limit
         );
     ELSE
         -- we continue iterating blocks in range
@@ -316,6 +399,15 @@ BEGIN
 
         _blocks_range.first_block = __lead_context_state.current_batch_end + 1;
 
+        IF _blocks_range.first_block > __block_limit THEN
+            -- a dependency has not committed the next block yet
+            _blocks_range := NULL;
+            IF _wait THEN
+                PERFORM pg_sleep( 0.25 );
+            END IF;
+            RETURN;
+        END IF;
+
         _blocks_range.last_block := LEAST(
               COALESCE(
                     _blocks_range.first_block + _override_max_batch - 1
@@ -324,6 +416,7 @@ BEGIN
             , COALESCE( _limit, __lead_context_state.end_block_range)
             , __lead_context_state.end_block_range
             , hive.get_irreversible_head_block()
+            , __block_limit
         );
     END IF;
 
@@ -331,7 +424,6 @@ BEGIN
     SET
           loop.current_batch_end = _blocks_range.last_block
         , loop.end_block_range = __lead_context_state.end_block_range
-        , loop.last_shadow_vacuum_block = CASE WHEN __vacuum_performed THEN _blocks_range.last_block ELSE (ctx.loop).last_shadow_vacuum_block END
     WHERE ctx.name=ANY(_contexts);
 
     PERFORM hive.update_attachment( _contexts );
@@ -342,11 +434,11 @@ BEGIN
 END;
 $body$;
 
-CREATE OR REPLACE PROCEDURE hive.app_next_iteration( _context hafd.context_name, _blocks_range OUT hive.blocks_range, _override_max_batch INTEGER = NULL, _limit INTEGER = NULL )
+CREATE OR REPLACE PROCEDURE hive.app_next_iteration( _context hafd.context_name, _blocks_range OUT hive.blocks_range, _override_max_batch INTEGER = NULL, _limit INTEGER = NULL, _wait BOOLEAN = TRUE )
     LANGUAGE 'plpgsql'
 AS
 $body$
 BEGIN
-    CALL hive.app_next_iteration( ARRAY[ _context ], _blocks_range, _override_max_batch, _limit );
+    CALL hive.app_next_iteration( ARRAY[ _context ], _blocks_range, _override_max_batch, _limit, _wait );
 END;
 $body$;

@@ -115,6 +115,8 @@ BEGIN
     FROM hafd.registered_tables hrt
     WHERE hrt.context_id = __context_id;
 
+    PERFORM hive.app_registry_context_removed( _name );
+
     DELETE FROM hafd.contexts_attachment WHERE context_id = __context_id;
     DELETE FROM hafd.contexts WHERE id = __context_id;
 
@@ -266,6 +268,11 @@ BEGIN
 
     IF __current_block_num > _last_synced_block THEN
         RAISE EXCEPTION 'Context % has already processed block nr %', _context, _last_synced_block;
+    END IF;
+
+    IF _last_synced_block > __current_block_num THEN
+        RAISE WARNING 'Attaching context % at block %, ahead of its last processed block % - blocks <%, %> will never be delivered to the application'
+            , _context, _last_synced_block, __current_block_num, __current_block_num + 1, _last_synced_block;
     END IF;
 
 

@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <hive/plugins/sql_serializer/all_accounts_dumper.h>
 
 #include <hive/plugins/sql_serializer/chunks_for_writers_spillter.h>
@@ -7,8 +8,8 @@
 
 #include <appbase/application.hpp>
 
-#include <hive/chain/account_object.hpp>
-#include <hive/chain/account_object_multiindex.hpp>
+#include <hive/chain/detail/state/account_object.hpp>
+#include <hive/chain/detail/state/account_object_multiindex.hpp>
 #include <hive/chain/database.hpp>
 
 #include <vector>

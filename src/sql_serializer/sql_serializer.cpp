@@ -1,3 +1,5 @@
+#include <iostream>
+#include <cstdint>
 #include <hive/plugins/sql_serializer/sql_serializer_plugin.hpp>
 
 #include <hive/plugins/sql_serializer/cached_data.h>
@@ -17,7 +19,8 @@
 #include <hive/chain/util/type_registrar_definition.hpp>
 
 #include <hive/chain/notifications.hpp>
-#include <hive/chain/witness_objects.hpp>
+#include <hive/chain/detail/state/reward_fund_object.hpp>
+#include <hive/chain/detail/state/witness_objects.hpp>
 #include <hive/chain/index.hpp>
 
 #include <chainbase/chainbase.inl>
@@ -783,6 +786,13 @@ void sql_serializer_plugin_impl::on_post_apply_block(const block_notification& n
 
     const hive::chain::dynamic_global_property_object& dgpo = chain_db.get_dynamic_global_properties();
 
+    /* dgpo no longer tracks the global reward fund (it lives in reward_fund_object from
+       genesis since hive 0a4b7c445); keep the historical column semantics: fund balance
+       before HF17, zero afterwards (the old dgpo field was zeroed at HF17). */
+    const hive::protocol::HIVE_asset total_reward_fund_hive =
+      chain_db.has_hardfork( HIVE_HARDFORK_0_17__771 ) ?
+      hive::protocol::HIVE_asset() : chain_db.get_reward_fund().get_reward_balance();
+
     currently_caching_data->total_size += note.block_id.data_size() + sizeof(note.block_num);
     currently_caching_data->blocks.emplace_back(
       note.block_id,
@@ -795,18 +805,18 @@ void sql_serializer_plugin_impl::on_post_apply_block(const block_notification& n
       block_header.witness_signature,
       witness_ptr->signing_key,
 
-      dgpo.hbd_interest_rate,
+      dgpo.get_hbd_interest_rate(),
 
-      dgpo.total_vesting_shares,
-      dgpo.total_vesting_fund_hive,
+      dgpo.get_total_vesting_shares(),
+      dgpo.get_total_vesting_fund_hive(),
 
-      dgpo.total_reward_fund_hive,
+      total_reward_fund_hive,
 
-      dgpo.virtual_supply,
-      dgpo.current_supply,
+      dgpo.get_virtual_supply(),
+      dgpo.get_current_supply(),
 
-      dgpo.current_hbd_supply,
-      dgpo.init_hbd_supply
+      dgpo.get_current_hbd_supply(),
+      dgpo.get_initial_hbd_supply()
       );
 
     _custom_json_cache.flush_pending( db_url, theApp );
@@ -856,9 +866,11 @@ void sql_serializer_plugin_impl::handle_transactions(const vector<std::shared_pt
     auto hash = trx->get_transaction_id();
     const hive::protocol::signed_transaction& signed_trx = trx->get_transaction();
     size_t sig_size = signed_trx.signatures.size();
+    int64_t rc_cost = trx->get_rc_cost();
 
     currently_caching_data->total_size += sizeof(hash) + sizeof(block_num) + sizeof(trx_in_block) +
-      sizeof(signed_trx.ref_block_num) + sizeof(signed_trx.ref_block_prefix) + sizeof(signed_trx.expiration) + sizeof(signed_trx.signatures[0]);
+      sizeof(signed_trx.ref_block_num) + sizeof(signed_trx.ref_block_prefix) + sizeof(signed_trx.expiration) + sizeof(signed_trx.signatures[0]) +
+      sizeof(rc_cost);
 
     currently_caching_data->transactions.emplace_back(
       hash,
@@ -867,7 +879,8 @@ void sql_serializer_plugin_impl::handle_transactions(const vector<std::shared_pt
       signed_trx.ref_block_num,
       signed_trx.ref_block_prefix,
       signed_trx.expiration,
-      (sig_size == 0) ? fc::optional<signature_type>() : fc::optional<signature_type>(signed_trx.signatures[0])
+      (sig_size == 0) ? fc::optional<signature_type>() : fc::optional<signature_type>(signed_trx.signatures[0]),
+      (rc_cost < 0) ? fc::optional<int64_t>() : fc::optional<int64_t>(rc_cost)
     );
 
     if(sig_size > 1)
