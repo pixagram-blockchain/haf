@@ -11,7 +11,9 @@ ARG CI_IMAGE_TAG=ubuntu26.04-pg${POSTGRES_VERSION}-1
 ARG BUILD_IMAGE_TAG
 ARG IMAGE_TAG_PREFIX
 
-FROM registry.gitlab.syncad.com/hive/hive/minimal-runtime:ubuntu26.04-1 AS minimal-runtime-base
+# Base images come from Docker Hub mirrors under pixadock/, copied unchanged from
+# registry.gitlab.syncad.com (same tags), so a Pixagram build never touches that registry.
+FROM pixadock/minimal-runtime:ubuntu26.04-1 AS minimal-runtime-base
 
 ARG POSTGRES_VERSION
 ARG PIP_INDEX_URL
@@ -117,7 +119,7 @@ RUN useradd -r -s /usr/sbin/nologin -b /nonexistent -c "HAF maintenance service 
 USER hived
 WORKDIR /home/hived
 
-FROM registry.gitlab.syncad.com/hive/common-ci-configuration/ci-base-image-ubuntu:ubuntu26.04-pg18-2 AS ci-base-image
+FROM pixadock/ci-base-image-ubuntu:ubuntu26.04-pg18-2 AS ci-base-image
 
 ARG POSTGRES_VERSION
 ENV POSTGRES_VERSION=${POSTGRES_VERSION}
