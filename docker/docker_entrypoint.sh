@@ -142,6 +142,22 @@ trap cleanup EXIT
 
 enable_pg_cron
 
+# Listening endpoints for hived, overridable via the container environment, e.g.
+# P2P_ENDPOINT=0.0.0.0:2001 for IPv4-only or a specific address such as
+# P2P_ENDPOINT=[2001:db8::1]:2001.
+# The default is dual-stack [::] (accepts both IPv6 and IPv4) whenever the kernel
+# has IPv6 enabled; the hived in this image binds outbound connections using the
+# peer's address family, so a [::] listener still sources IPv4 connections from
+# the listening port.  Kernels booted with ipv6.disable=1 fall back to 0.0.0.0.
+if [ -f /proc/net/if_inet6 ]; then
+  DEFAULT_BIND_ADDR="[::]"
+else
+  DEFAULT_BIND_ADDR="0.0.0.0"
+fi
+P2P_ENDPOINT="${P2P_ENDPOINT:-${DEFAULT_BIND_ADDR}:${P2P_PORT}}"
+WS_ENDPOINT="${WS_ENDPOINT:-${DEFAULT_BIND_ADDR}:${WS_PORT}}"
+HTTP_ENDPOINT="${HTTP_ENDPOINT:-${DEFAULT_BIND_ADDR}:${HTTP_PORT}}"
+
 {
 export LD_PRELOAD="${OVERRIDE_LD_PRELOAD:-}"
 /bin/bash <<EOF
@@ -152,7 +168,7 @@ if [ ! -f "$DATADIR/config.ini" ]; then
   echo "WARNING: No config file exists at $DATADIR/config.ini, creating a default config file"
   echo "WARNING: Default config uses larger shared memory - consider providing config_5M.ini for CI builds"
 
-  /home/hived/bin/hived --webserver-ws-endpoint=0.0.0.0:${WS_PORT} --webserver-http-endpoint=0.0.0.0:${HTTP_PORT} --p2p-endpoint=0.0.0.0:${P2P_PORT} \
+  /home/hived/bin/hived --webserver-ws-endpoint="${WS_ENDPOINT}" --webserver-http-endpoint="${HTTP_ENDPOINT}" --p2p-endpoint="${P2P_ENDPOINT}" \
     --data-dir="$DATADIR" --shared-file-dir="$SHM_DIR" --psql-wal-directory="$WAL_DIR" \
     --plugin=sql_serializer --psql-url="dbname=haf_block_log host=/var/run/postgresql port=5432" \
     ${HIVED_ARGS[@]} --dump-config > /dev/null 2>&1
@@ -170,7 +186,7 @@ fi
 # Log shared memory configuration for debugging
 echo "Config shared-file-size: \$(grep -E '^shared-file-size' "$DATADIR/config.ini" 2>/dev/null || echo 'not set')"
 
-/home/hived/bin/hived --webserver-ws-endpoint=0.0.0.0:${WS_PORT} --webserver-http-endpoint=0.0.0.0:${HTTP_PORT} --p2p-endpoint=0.0.0.0:${P2P_PORT} \
+/home/hived/bin/hived --webserver-ws-endpoint="${WS_ENDPOINT}" --webserver-http-endpoint="${HTTP_ENDPOINT}" --p2p-endpoint="${P2P_ENDPOINT}" \
   --data-dir="$DATADIR" --shared-file-dir="$SHM_DIR" --psql-wal-directory="$WAL_DIR" \
   --plugin=sql_serializer --psql-url="dbname=haf_block_log host=/var/run/postgresql port=5432" \
   ${HIVED_ARGS[@]}

@@ -21,7 +21,7 @@ variables:
   HAF_CI_MODE: "1"
   # Hive ref for fetching CI helper scripts at runtime (symlinks don't work without submodule checkout)
   # Should match the ref used in scripts/ci-helpers/prepare_data_image_job.yml include
-  HIVE_SCRIPTS_REF: "3f8bf00eb992941b02be8fd18726476c9df143e5"
+  HIVE_SCRIPTS_REF: "d15a8e69bd6fca07d5636d4c66bffa4051937709"
 
   # =============================================================================
   # Quick Test / Auto-Skip Mode
@@ -68,6 +68,11 @@ variables:
   GIT_SUBMODULE_STRATEGY: none
   # Force HTTPS for submodule URLs (helps with nested submodules)
   GIT_SUBMODULE_FORCE_HTTPS: "true"
+  # Retry the whole get-sources step: shallow-pinned nested submodules
+  # (rocksdb, secp256k1-zkp, websocketpp under hive/libraries/fc) fetch from
+  # external mirrors and intermittently fail with "Unable to find current
+  # revision" on cold runner caches
+  GET_SOURCES_ATTEMPTS: "3"
   # Allow file:// protocol for nested submodules
   GIT_CONFIG_COUNT: 1
   GIT_CONFIG_KEY_0: "protocol.file.allow"
@@ -86,7 +91,7 @@ variables:
   # Use Ubuntu-based ci-base-image with PostgreSQL 18 dev packages
   # Ubuntu variant needed because hived is built on Ubuntu 24.04 and replay jobs
   # run the binary directly on the ci-base-image (requires matching glibc)
-  BUILDER_IMAGE_TAG: ":ubuntu24.04-pg18-1"
+  BUILDER_IMAGE_TAG: ":ubuntu26.04-pg18-2"
   HIVE_CI_BASE_IMAGE: "registry.gitlab.syncad.com/hive/common-ci-configuration/ci-base-image-ubuntu${BUILDER_IMAGE_TAG}"
   PYTHON_IMAGE: "registry.gitlab.syncad.com/hive/common-ci-configuration/ci-base-image-ubuntu${BUILDER_IMAGE_TAG}"
   CI_DEBUG_SERVICES: "true"
@@ -150,7 +155,13 @@ default:
       git fetch origin develop master || git fetch origin "$HIVE_COMMIT"
       git checkout $HIVE_COMMIT
       # Initialize only test-related submodules inside hive (skip rocksdb, zstd, fc, appbase, compression_dictionaries)
-      git submodule update --init tests/python/hive-local-tools/tests_api
+      ok=0
+      for attempt in 1 2 3; do
+        if git submodule update --init tests/python/hive-local-tools/tests_api; then ok=1; break; fi
+        echo "submodule update failed (attempt $attempt), retrying..."
+        sleep 10
+      done
+      [ "$ok" -eq 1 ]
       cd ..
       # Update any remaining HAF submodules (currently none besides hive which is handled above)
       git submodule update --init
@@ -175,7 +186,16 @@ default:
       git fetch origin develop master || git fetch origin "$HIVE_COMMIT"
       git checkout $HIVE_COMMIT
       # Initialize ALL submodules recursively (needed for rebuilding HAF)
-      git submodule update --init --recursive
+      # Nested fc submodules (rocksdb, secp256k1-zkp, websocketpp) fetch from
+      # external mirrors and flake intermittently; retry up to 3 times
+      ok=0
+      for attempt in 1 2 3; do
+        if git submodule update --init --recursive; then ok=1; break; fi
+        echo "submodule update failed (attempt $attempt), retrying..."
+        git submodule sync --recursive
+        sleep 10
+      done
+      [ "$ok" -eq 1 ]
       cd ..
       # Update any remaining HAF submodules (currently none besides hive which is handled above)
       git submodule update --init
@@ -298,7 +318,16 @@ detect_changes:
           echo "MR pipeline: comparing against target branch"
         elif [[ "${CI_PIPELINE_SOURCE:-}" == "push" ]]; then
           BASE_SHA="${CI_COMMIT_BEFORE_SHA:-HEAD~1}"
-          echo "Push pipeline: comparing against pre-push state ($BASE_SHA)"
+          # After a force-push CI_COMMIT_BEFORE_SHA is the replaced head (all zeros for a
+          # new branch): diffing against it shows only what the rewrite changed, not what
+          # the branch changes, and the pipeline can be misclassified as a SQL-only or
+          # test-only change. Fall back to the merge-base with develop in that case.
+          if [[ "$BASE_SHA" =~ ^0+$ ]] || ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
+            BASE_SHA=$(git merge-base HEAD origin/develop 2>/dev/null || echo "HEAD~1")
+            echo "Push pipeline: pre-push state is not an ancestor of HEAD (force-push or new branch), comparing against develop ($BASE_SHA)"
+          else
+            echo "Push pipeline: comparing against pre-push state ($BASE_SHA)"
+          fi
         else
           BASE_SHA=$(git merge-base HEAD origin/develop 2>/dev/null || echo "HEAD~1")
           echo "Other pipeline: comparing against develop"
@@ -330,6 +359,24 @@ detect_changes:
         ANY_SQL_CHANGED=$(echo "$CHANGED_FILES" | grep -E "$SQL_PATTERNS" || true)
         NON_SQL_SOURCE=$(echo "$NON_SKIP_FILES" | grep -vE "$SQL_PATTERNS" || true)
 
+        # SQL files listed under SCHEMA_SOURCES define the persistent hafd schema
+        # (tables). The thin overlay reuses cached replay data and updates the
+        # extension in place, which the schema-hash check refuses when tables
+        # changed - such changes need a full build and a fresh replay.
+        SCHEMA_SQL_CHANGED=""
+        if [[ -n "$SQL_CHANGED" ]]; then
+          SCHEMA_SOURCES=$(awk '
+            { sub(/#.*/, "") }
+            /ADD_PSQL_EXTENSION[[:space:]]*\(/ { in_macro = 1 }
+            in_macro && /^[[:space:]]*\)/ { in_macro = 0; mode = "" }
+            !in_macro { next }
+            { for (i = 1; i <= NF; i++) {
+                if ($i == "SCHEMA_SOURCES" || $i == "DEPLOY_SOURCES" || $i == "NAME") { mode = $i; continue }
+                if (mode == "SCHEMA_SOURCES" && $i ~ /\.sql$/) print "src/hive_fork_manager/" $i
+            } }' src/hive_fork_manager/CMakeLists.txt)
+          SCHEMA_SQL_CHANGED=$(grep -Fx -f <(echo "$SCHEMA_SOURCES") <<< "$SQL_CHANGED" || true)
+        fi
+
         # Determine build mode
         SQL_ONLY_CHANGE=false
         if [[ -z "$NON_SKIP_FILES" ]]; then
@@ -338,13 +385,18 @@ detect_changes:
           CAN_SKIP_REPLAY=true
           echo ""
           echo "=== Can skip build entirely (only tests/docs changed) ==="
-        elif [[ -z "$NON_SQL_SOURCE" && -n "$SQL_CHANGED" ]]; then
+        elif [[ -z "$NON_SQL_SOURCE" && -n "$SQL_CHANGED" && -z "$SCHEMA_SQL_CHANGED" ]]; then
           # Only SQL files changed (plus maybe tests/docs) - use thin overlay
           SQL_ONLY_CHANGE=true
           echo ""
           echo "=== SQL-only change detected - will use thin overlay build ==="
           echo "SQL files changed:"
           echo "$SQL_CHANGED" | head -10
+        elif [[ -n "$SCHEMA_SQL_CHANGED" ]]; then
+          echo ""
+          echo "=== Full build and replay required (hafd schema sources changed) ==="
+          echo "Schema source files changed:"
+          echo "$SCHEMA_SQL_CHANGED" | head -20
         else
           echo ""
           echo "=== Full build required (C++ source changed) ==="
@@ -449,9 +501,12 @@ detect_changes:
   extends: .prepare_haf_image
   stage: build_and_test_phase_1
   variables:
-    # Build jobs need ALL submodules (including rocksdb, zstd) for compilation
-    # Override the global 'none' strategy with 'recursive' for builds
-    GIT_SUBMODULE_STRATEGY: recursive
+    # Build jobs need ALL submodules (including rocksdb, zstd) for compilation.
+    # Submodules are initialized manually via .init_submodules_full below:
+    # runner-level recursive updates fail deterministically on cached
+    # workspaces ("Unable to find current revision" in nested fc submodules);
+    # the manual path clones hive fresh and retries.
+    GIT_SUBMODULE_STRATEGY: none
     # Smart image build thresholds - re-tag when gap > 20, rebuild when > 25
     RETAG_THRESHOLD: "20"
     SEARCH_DEPTH: "25"
@@ -467,6 +522,8 @@ detect_changes:
     - !reference [.docker_image_builder_job_template, before_script]
     # Fix git safe.directory issue on some runners (CVE-2022-24765)
     - git config --global --add safe.directory '*'
+    # Fresh clone + recursive init of the hive submodule (with retries)
+    - !reference [.init_submodules_full, before_script]
     # Load source patterns from the single source of truth
     - |
       SOURCE_PATTERNS=$("${CI_PROJECT_DIR}/scripts/ci-helpers/source-patterns.sh")
@@ -601,6 +658,23 @@ detect_changes:
         echo "CACHED_IMAGE_NAME=$CACHED_IMAGE" >> smart_build_decision.env
       fi
 
+      # Never reuse (skip / retag / overlay) a cached image built for another
+      # PostgreSQL major: hive_fork_manager.so and the cluster format are
+      # per-major, so a cached PG17 image must not become this job's
+      # PG${POSTGRES_VERSION} image. Relevant while a default swap (17 -> 18 in
+      # 1.29) or the pg17 variant's first build can find an older image at the
+      # same registry path.
+      if [[ "$BUILD_ACTION" != "build" && -n "${CACHED_IMAGE_NAME:-}" ]]; then
+        docker pull "${CACHED_IMAGE_NAME}" >/dev/null 2>&1 || true
+        CACHED_PG_VERSION=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CACHED_IMAGE_NAME}" 2>/dev/null | grep '^POSTGRES_VERSION=' | cut -d= -f2 || true)
+        if [[ -n "$CACHED_PG_VERSION" && "$CACHED_PG_VERSION" != "${POSTGRES_VERSION}" ]]; then
+          echo "Cached image ${CACHED_IMAGE_NAME} runs PostgreSQL ${CACHED_PG_VERSION}; this job targets ${POSTGRES_VERSION}. Forcing a full build."
+          BUILD_ACTION="build"
+          SQL_OVERLAY_BUILD=false
+          echo "BUILD_ACTION=build" >> smart_build_decision.env
+        fi
+      fi
+
       echo ""
       echo "Build decision: BUILD_ACTION=${BUILD_ACTION}"
       echo -e "\e[0Ksection_end:$(date +%s):smart_build\r\e[0K"
@@ -686,7 +760,7 @@ detect_changes:
           echo "Detecting PostgreSQL version from base image..."
           docker pull "${CACHED_IMAGE_NAME}" >/dev/null 2>&1 || true
           BASE_PG_VERSION=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CACHED_IMAGE_NAME}" 2>/dev/null | grep '^POSTGRES_VERSION=' | cut -d= -f2)
-          BASE_PG_VERSION="${BASE_PG_VERSION:-17}"
+          BASE_PG_VERSION="${BASE_PG_VERSION:-18}"
           echo "Base image PostgreSQL version: ${BASE_PG_VERSION}"
 
           # Generate extension SQL files using the local script
@@ -747,7 +821,9 @@ haf_image_build:
   variables:
     BINARY_CACHE_PATH: "$CI_PROJECT_DIR/haf-binaries"
     HIVE_NETWORK_TYPE: mainnet
-    POSTGRES_VERSION: "17"
+    # The default image runs PostgreSQL 18 since 1.29; haf_image_build_pg17
+    # below publishes the previous major under hive/haf/pg17.
+    POSTGRES_VERSION: "18"
   tags:
     - bigjob
   after_script:
@@ -775,7 +851,7 @@ haf_image_build_testnet:
   variables:
     BINARY_CACHE_PATH: "$CI_PROJECT_DIR/haf-testnet-binaries"
     HIVE_NETWORK_TYPE: testnet
-    POSTGRES_VERSION: "17"
+    POSTGRES_VERSION: "18"
   tags:
     - bigjob
   after_script:
@@ -804,7 +880,7 @@ haf_image_build_mirrornet:
   variables:
     BINARY_CACHE_PATH: "$CI_PROJECT_DIR/haf-mirrornet-binaries"
     HIVE_NETWORK_TYPE: mirrornet
-    POSTGRES_VERSION: "17"
+    POSTGRES_VERSION: "18"
   tags:
     - bigjob
   # Tag mirrornet images for Denser's CI and external publishing
@@ -829,15 +905,37 @@ haf_image_build_mirrornet:
         docker push ${IMAGE_NAME_PREFIX}${CI_COMMIT_TAG}
       fi
 
-haf_image_build_pg18:
+# The previous PostgreSQL major, published under hive/haf/pg17 (and mirrored to
+# registry.hive.blog/haf/pg17) for nodes that want to stay on 17 for a while.
+# Expected to be dropped once 19 takes this slot as the non-default option.
+haf_image_build_pg17:
   extends: .haf_image_build
   variables:
-    BINARY_CACHE_PATH: "$CI_PROJECT_DIR/haf-pg18-binaries"
+    BINARY_CACHE_PATH: "$CI_PROJECT_DIR/haf-pg17-binaries"
     HIVE_NETWORK_TYPE: mainnet
-    POSTGRES_VERSION: "18"
-    PG_IMAGE_SUBPATH: "pg18"
+    POSTGRES_VERSION: "17"
+    PG_IMAGE_SUBPATH: "pg17"
   tags:
     - bigjob
+  # Add latest/stable/version aliases like the testnet/mirrornet variants do --
+  # without this the pg17 image is only reachable by commit sha.
+  after_script:
+    - |
+      source docker_image_name.env
+      echo "Adding latest/stable/version tags for pg17 image..."
+      timeout 300 docker pull $HAF_INSTANCE || echo "Warning: docker pull failed or timed out"
+      IMAGE_NAME_PREFIX="${CI_REGISTRY_IMAGE}/pg17:"
+      if [[ "$CI_COMMIT_BRANCH" == "develop" ]]; then
+        docker tag $HAF_INSTANCE ${IMAGE_NAME_PREFIX}latest
+        docker push ${IMAGE_NAME_PREFIX}latest
+      elif [[ "$CI_COMMIT_BRANCH" == "master" ]]; then
+        docker tag $HAF_INSTANCE ${IMAGE_NAME_PREFIX}stable
+        docker push ${IMAGE_NAME_PREFIX}stable
+      fi
+      if [[ -n "$CI_COMMIT_TAG" && "$CI_COMMIT_REF_PROTECTED" == "true" ]]; then
+        docker tag $HAF_INSTANCE ${IMAGE_NAME_PREFIX}${CI_COMMIT_TAG}
+        docker push ${IMAGE_NAME_PREFIX}${CI_COMMIT_TAG}
+      fi
 
 .haf-service: &haf-service
   name: $HAF_IMAGE_NAME
@@ -1302,6 +1400,8 @@ replay_with_keyauths:
       - "replay_with_keyauths.log"
       - "node_logs.log"
       - "node_logs1.log"
+      - "pg_logs/"
+    when: always
   tags:
     - public-runner-docker
 
@@ -1323,6 +1423,8 @@ replay_with_json_metadata:
       - "replay_with_json_metadata.log"
       - "node_logs.log"
       - "node_logs1.log"
+      - "pg_logs/"
+    when: always
   tags:
     - public-runner-docker
 
@@ -1595,10 +1697,10 @@ prepare_haf_data:
     - data-cache-storage
     - fastest
 
-prepare_haf_data_pg18:
+prepare_haf_data_pg17:
   extends: .prepare_haf_data_5m
   needs:
-    - job: haf_image_build_pg18
+    - job: haf_image_build_pg17
       artifacts: true
   stage: build_and_test_phase_1
   timeout: 80m
@@ -1606,9 +1708,9 @@ prepare_haf_data_pg18:
     HIVE_NETWORK_TYPE: mainnet
     BLOCK_LOG_SOURCE_DIR: "$BLOCK_LOG_SOURCE_DIR_5M"
     CONFIG_INI_SOURCE: "$CI_PROJECT_DIR/docker/config_5M.ini"
-    HAF_CACHE_TYPE: "haf18"
-    DATA_CACHE_HAF_PREFIX: "/cache/haf18"
-    DATA_CACHE_DIR: "/cache/haf18_${HAF_COMMIT}"
+    HAF_CACHE_TYPE: "haf17"
+    DATA_CACHE_HAF_PREFIX: "/cache/haf17"
+    DATA_CACHE_DIR: "/cache/haf17_${HAF_COMMIT}"
   after_script:
     - echo "Cleanup complete"
   tags:
@@ -1758,9 +1860,10 @@ cleanup_old_haf_cache:
 publish_images:
   extends: .docker_publish_job_template
   variables:
-    # Publish mainnet (root) and mirrornet images to registry.hive.blog
+    # Publish mainnet (root), mirrornet and the pg17 variant to registry.hive.blog
+    # (haf_api_node selects pg17 with HAF_IMAGE=.../haf/pg17).
     # Note: testnet is not published externally (internal use only)
-    PUBLISH_IMAGES: "haf mirrornet"
+    PUBLISH_IMAGES: "haf mirrornet pg17"
 
 double_haf_replay_tests:
   extends: .docker_image_builder_job

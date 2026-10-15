@@ -37,7 +37,7 @@ install_ai_packages() {
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git \
-    python3.12 python3.12-venv python3.12-dev python3-pip \
+    python3 python3-venv python3-dev python3-pip \
     postgresql-plpython3-${POSTGRES_VERSION} \
     curl \
     python3-bs4 python3-lxml
@@ -47,6 +47,12 @@ install_ai_packages() {
   rm -rf /root/.cache ~/.cache /tmp/* /var/tmp/*
   find / -type d -name '__pycache__' -exec rm -rf {} +
 
+  # typing_extensions first, as a pip-managed copy under /usr/local that
+  # shadows Ubuntu's python3-typing-extensions (4.15.0, pulled in by apt
+  # above). tokenizers -> huggingface_hub -> anyio 4.15.1+ needs >= 4.16.0,
+  # and pip cannot replace the Debian package ("no RECORD file was found"),
+  # which failed every fresh image build once the layer cache expired.
+  pip3 install --break-system-packages --ignore-installed typing_extensions
   pip3 install --break-system-packages tokenizers base58
 
   mkdir -p /home/hived/tokenizer-files
@@ -108,7 +114,7 @@ install_all_dev_packages() {
 
   DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-${POSTGRES_VERSION} postgresql-server-dev-${POSTGRES_VERSION} \
   netcat-openbsd \
-  git python3.12 python3.12-venv python3.12-dev python3-pip postgresql-plpython3-${POSTGRES_VERSION} curl # for hivesense
+  git python3 python3-venv python3-dev python3-pip postgresql-plpython3-${POSTGRES_VERSION} curl # for hivesense
 
   apt-get clean
   rm -rf /var/lib/apt/lists/*

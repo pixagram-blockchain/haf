@@ -1,9 +1,13 @@
+# SCHEMA_SOURCES / DEPLOY_SOURCES below are also parsed by
+# scripts/generate_extension_sql.sh (overlay build path). Keep entries as
+# whitespace-separated tokens ending in .sql; comments use `#`.
 ADD_PSQL_EXTENSION(
     NAME hive_fork_manager
     SCHEMA_SOURCES schemas.sql
              context_rewind/data_schema_types.sql
              application_loop/stages.sql
              context_rewind/data_schema.sql
+             applications.sql
              events_queue.sql
              forks.sql
              app_context.sql
@@ -60,6 +64,7 @@ ADD_PSQL_EXTENSION(
             app_api_impl.sql
             hived_api.sql
             app_api.sql
+            app_registry.sql
             api_helpers/block_api_support.sql
             authorization.sql
             get_impacted_accounts.sql
@@ -87,6 +92,9 @@ ADD_PSQL_EXTENSION(
             state_providers/update_providers.sql
 
             vacuum_shadow_table.sql
+            wait_for_new_block.sql
+
+            app_locks.sql
 
 )
 

@@ -271,6 +271,10 @@ BEGIN
     ) THEN
         ALTER TABLE hafd.hive_state ADD COLUMN lite_mode boolean NOT NULL DEFAULT FALSE;
     END IF;
+
+    -- Note: there is intentionally no migration for the rc_cost column of hafd.transactions
+    -- and hafd.transactions_reversible - the values cannot be backfilled without a replay,
+    -- so the schema hash mismatch reported by verify_table_schema forces one.
 END \$\$;
 "
 
